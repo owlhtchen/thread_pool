@@ -13,6 +13,7 @@ class ThreadPool {
     std::deque<std::function<void()>> tasks;
     std::mutex tasksMutex;
     std::condition_variable notEmpty;
+    std::condition_variable workerDone;
 
     bool endPool;
     
@@ -22,6 +23,13 @@ class ThreadPool {
     ThreadPool(unsigned int numThreads): endPool(false), numThreads(numThreads) { 
         createWorkers(numThreads);
     };
+    ~ThreadPool() {
+        endPool = true;
+        notEmpty.notify_all(); // in case any worker is blocked on notEmpty cond variable
+        for(auto& t: threads) {
+            t.join();
+        }
+    }
 
     void add(std::function<void()> task) {
         {
@@ -40,20 +48,34 @@ class ThreadPool {
     }
 
     void worker() {
-        while(endPool) {
+        while(!endPool) {
             std::unique_lock<std::mutex> lk(tasksMutex);
-            notEmpty.wait(lk, [&](){ return !tasks.empty() || endPool; });
-            if(!endPool) {
-                auto current = std::move(tasks.front());
-                tasks.pop_front();
-                lk.unlock();
-                current();
+            while(tasks.empty() && !endPool) {
+                workerDone.notify_all();
+                notEmpty.wait(lk);  
+                // unlocks tasksMutex; both waitAll and workers might wake up;
+                // if worker woke up, then wokerDone.notify_all() called again and
+                // but waitAll could miss the signal (waitAll woke up but is waiting for the lock)
             }
+            auto current = std::move(tasks.front());
+            tasks.pop_front();
+            lk.unlock();
+            current();
         }
     }
 
     void waitAll() {
-
+        std::unique_lock<std::mutex> lk(tasksMutex);
+        if(tasks.empty()) {
+            lk.unlock();
+        } else {
+            int numWakenUpByWorker = 0;
+            int numTaskInProgress = tasks.size();
+            while(numWakenUpByWorker < numTaskInProgress) {
+                workerDone.wait(lk);
+                numWakenUpByWorker++;
+            }
+        }
     }
 };
 
